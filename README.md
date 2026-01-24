@@ -91,6 +91,32 @@ for seg in segments {
 ```
 See `examples/diarization.rs` for combining with TDT transcription.
 
+## Microphone Transcription (Push-to-Talk)
+
+Real-time microphone transcription with global hotkey support. Transcriptions are typed directly into the active window.
+
+```bash
+# Build (requires libxdo on Linux: sudo pacman -S xdotool / sudo apt install libxdo-dev)
+cargo build --release --example mic_transcribe --features cuda
+
+# Run
+cargo run --release --example mic_transcribe --features cuda -- ./path/to/tdt-model
+```
+
+**Configuration** (`~/.config/mic_transcribe.conf`):
+```ini
+# Hotkey to trigger recording (supports modifiers: LAlt, RAlt, LControl, RControl, LShift, RShift, LMeta, RMeta)
+hotkey = LAlt+R
+
+# Mode: "hold" = hold-to-talk, "toggle" = press to start/stop with VAD auto-segmentation
+mode = hold
+```
+
+**Supported keys**: F1-F20, A-Z, 0-9, Grave, Space, Tab, Insert, Delete, Home, End, PageUp, PageDown
+
+**Modes**:
+- `hold`: Hold hotkey to record, release to transcribe (classic push-to-talk)
+- `toggle`: Press to start continuous listening, VAD auto-segments speech, press again to stop
 
 ## Setup
 
