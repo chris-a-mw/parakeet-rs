@@ -52,6 +52,7 @@ const CHANNELS: u16 = 1;
 const RMS_THRESHOLD: f32 = 0.01;
 const SILENCE_DURATION_MS: u64 = 500;
 const MIN_SPEECH_SAMPLES: usize = 8000; // ~0.5s minimum
+const MIN_SPEECH_RMS: f32 = 0.005; // Minimum RMS to consider audio as containing speech
 
 struct RmsVad {
     threshold: f32,
@@ -112,6 +113,14 @@ fn calculate_rms(samples: &[f32]) -> f32 {
     }
     let sum_squares: f32 = samples.iter().map(|s| s * s).sum();
     (sum_squares / samples.len() as f32).sqrt()
+}
+
+/// Check if audio buffer contains actual speech content (not just silence/noise)
+fn has_speech_content(samples: &[f32]) -> bool {
+    if samples.len() < MIN_SPEECH_SAMPLES {
+        return false;
+    }
+    calculate_rms(samples) >= MIN_SPEECH_RMS
 }
 
 // i3status-rust integration
@@ -583,10 +592,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         // Stop listening - transcribe any remaining audio
                         let buffer = audio_buffer.lock().unwrap();
-                        if buffer.len() >= MIN_SPEECH_SAMPLES {
-                            let samples = buffer.clone();
-                            drop(buffer);
+                        let samples = buffer.clone();
+                        drop(buffer);
 
+                        if has_speech_content(&samples) {
                             if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                                 let model = model.clone();
                                 let tx = tx.clone();
@@ -606,8 +615,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     transcribing.store(false, Ordering::SeqCst);
                                 });
                             }
-                        } else {
-                            drop(buffer);
                         }
                         println!("\r\x1b[K[IDLE] Press {} to start listening...", hotkey_config.display_name);
                         write_status("idle");
@@ -648,10 +655,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     listening.store(false, Ordering::SeqCst);
 
                     let buffer = audio_buffer.lock().unwrap();
-                    if buffer.len() >= MIN_SPEECH_SAMPLES {
-                        let samples = buffer.clone();
-                        drop(buffer);
+                    let samples = buffer.clone();
+                    drop(buffer);
 
+                    if has_speech_content(&samples) {
                         if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                             print!("\r\x1b[K[TRANSCRIBING] Processing...");
                             std::io::stdout().flush()?;
@@ -681,8 +688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("\r\x1b[K[BUSY] Previous transcription still running, skipping...");
                         }
                     } else {
-                        drop(buffer);
-                        println!("\r\x1b[K[IDLE] (too short) Hold {} to record...", hotkey_config.display_name);
+                        println!("\r\x1b[K[IDLE] (no speech detected) Hold {} to record...", hotkey_config.display_name);
                         write_status("idle");
                     }
                 }
@@ -699,37 +705,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let check_start = buffer.len().saturating_sub(1600);
                 let recent = &buffer[check_start..];
 
-                if vad.process(recent) && buffer.len() >= MIN_SPEECH_SAMPLES {
-                    // End of speech detected - transcribe this segment
+                if vad.process(recent) {
+                    // End of speech detected - transcribe this segment if it has content
                     let samples = buffer.clone();
                     buffer.clear(); // Clear for next utterance
                     drop(buffer);
 
-                    // Skip if already transcribing to prevent pile-up
-                    if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                        print!("\r\x1b[K[TRANSCRIBING] Processing segment...");
-                        std::io::stdout().flush()?;
-                        write_status("transcribing");
+                    if has_speech_content(&samples) {
+                        // Skip if already transcribing to prevent pile-up
+                        if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            print!("\r\x1b[K[TRANSCRIBING] Processing segment...");
+                            std::io::stdout().flush()?;
+                            write_status("transcribing");
 
-                        let model = model.clone();
-                        let tx = tx.clone();
-                        let transcribing = transcribing.clone();
-                        thread::spawn(move || {
-                            if let Ok(mut model) = model.try_lock() {
-                                match model.transcribe_samples(samples, SAMPLE_RATE, CHANNELS, None) {
-                                    Ok(result) => {
-                                        let text = result.text.trim().to_string();
-                                        if !text.is_empty() {
-                                            let _ = tx.send(text);
+                            let model = model.clone();
+                            let tx = tx.clone();
+                            let transcribing = transcribing.clone();
+                            thread::spawn(move || {
+                                if let Ok(mut model) = model.try_lock() {
+                                    match model.transcribe_samples(samples, SAMPLE_RATE, CHANNELS, None) {
+                                        Ok(result) => {
+                                            let text = result.text.trim().to_string();
+                                            if !text.is_empty() {
+                                                let _ = tx.send(text);
+                                            }
                                         }
+                                        Err(e) => eprintln!("\r\x1b[K[ERROR] Transcription failed: {}", e),
                                     }
-                                    Err(e) => eprintln!("\r\x1b[K[ERROR] Transcription failed: {}", e),
                                 }
-                            }
-                            transcribing.store(false, Ordering::SeqCst);
-                            // Still listening in toggle mode, so go back to listening state
-                            write_status("listening");
-                        });
+                                transcribing.store(false, Ordering::SeqCst);
+                                // Still listening in toggle mode, so go back to listening state
+                                write_status("listening");
+                            });
+                        }
                     }
                 }
             }
