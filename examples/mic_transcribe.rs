@@ -114,6 +114,34 @@ fn calculate_rms(samples: &[f32]) -> f32 {
     (sum_squares / samples.len() as f32).sqrt()
 }
 
+// i3status-rust integration
+const STATUS_FILE: &str = "/tmp/parakeet-status";
+const CONTROL_FILE: &str = "/tmp/parakeet-control";
+
+fn write_status(state: &str) {
+    let text = match state {
+        "listening" => "󰏃 Listening",
+        "transcribing" => "⏳ Transcribing",
+        _ => "󰍭 Idle",
+    };
+    let _ = fs::write(STATUS_FILE, text);
+}
+
+fn clear_status() {
+    let _ = fs::remove_file(STATUS_FILE);
+    let _ = fs::remove_file(CONTROL_FILE);
+}
+
+/// Check if toggle was requested via control file (e.g., i3status-rust click)
+fn check_toggle_request() -> bool {
+    if let Ok(content) = fs::read_to_string(CONTROL_FILE) {
+        let _ = fs::remove_file(CONTROL_FILE);
+        content.trim() == "toggle"
+    } else {
+        false
+    }
+}
+
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
@@ -451,6 +479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let running = running.clone();
         ctrlc::set_handler(move || {
             println!("\nExiting...");
+            clear_status();
             running.store(false, Ordering::SeqCst);
         })?;
     }
@@ -508,6 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         PttMode::Hold => println!("[IDLE] Hold {} to record...", hotkey_config.display_name),
         PttMode::Toggle => println!("[IDLE] Press {} to start listening...", hotkey_config.display_name),
     }
+    write_status("idle");
 
     while running.load(Ordering::SeqCst) {
         // Check for transcription results from background threads
@@ -531,10 +561,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key_just_released = !key_pressed && was_key_pressed;
         was_key_pressed = key_pressed;
 
+        // Check for toggle request from i3status-rust click
+        let click_toggle = check_toggle_request();
+
         // Handle key events based on mode
         match ptt_mode {
             PttMode::Toggle => {
-                if key_just_pressed {
+                if key_just_pressed || click_toggle {
                     is_listening = !is_listening;
                     listening.store(is_listening, Ordering::SeqCst);
 
@@ -546,6 +579,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         vad.reset();
                         println!("\r\x1b[K[LISTENING] Speak now... (press {} to stop)", hotkey_config.display_name);
+                        write_status("listening");
                     } else {
                         // Stop listening - transcribe any remaining audio
                         let buffer = audio_buffer.lock().unwrap();
@@ -576,12 +610,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             drop(buffer);
                         }
                         println!("\r\x1b[K[IDLE] Press {} to start listening...", hotkey_config.display_name);
+                        write_status("idle");
                     }
                 }
             }
             PttMode::Hold => {
-                if key_just_pressed && !is_listening {
-                    // Start listening (hold mode)
+                // Click toggle acts like toggle mode in hold mode
+                if click_toggle && !is_listening {
+                    // Start listening via click
+                    is_listening = true;
+                    listening.store(true, Ordering::SeqCst);
+                    {
+                        let mut buffer = audio_buffer.lock().unwrap();
+                        buffer.clear();
+                    }
+                    vad.reset();
+                    println!("\r\x1b[K[LISTENING] Recording... (click or release {} to transcribe)", hotkey_config.display_name);
+                    write_status("listening");
+                } else if key_just_pressed && !is_listening {
+                    // Start listening (hold mode - key press)
                     is_listening = true;
                     listening.store(true, Ordering::SeqCst);
                     {
@@ -590,9 +637,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     vad.reset();
                     println!("\r\x1b[K[LISTENING] Recording... (release {} to transcribe)", hotkey_config.display_name);
+                    write_status("listening");
                 }
 
-                if key_just_released && is_listening {
+                // Transcribe on key release OR click toggle while listening
+                let stop_requested = key_just_released || (click_toggle && is_listening);
+                if stop_requested && is_listening {
                     // Stop listening and transcribe (hold mode)
                     is_listening = false;
                     listening.store(false, Ordering::SeqCst);
@@ -605,6 +655,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                             print!("\r\x1b[K[TRANSCRIBING] Processing...");
                             std::io::stdout().flush()?;
+                            write_status("transcribing");
 
                             let model = model.clone();
                             let tx = tx.clone();
@@ -624,6 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 transcribing.store(false, Ordering::SeqCst);
                                 println!("\r\x1b[K[IDLE] Hold {} to record...", hotkey_display);
+                                write_status("idle");
                             });
                         } else {
                             println!("\r\x1b[K[BUSY] Previous transcription still running, skipping...");
@@ -631,6 +683,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         drop(buffer);
                         println!("\r\x1b[K[IDLE] (too short) Hold {} to record...", hotkey_config.display_name);
+                        write_status("idle");
                     }
                 }
             }
@@ -656,6 +709,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                         print!("\r\x1b[K[TRANSCRIBING] Processing segment...");
                         std::io::stdout().flush()?;
+                        write_status("transcribing");
 
                         let model = model.clone();
                         let tx = tx.clone();
@@ -673,6 +727,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             transcribing.store(false, Ordering::SeqCst);
+                            // Still listening in toggle mode, so go back to listening state
+                            write_status("listening");
                         });
                     }
                 }
@@ -682,6 +738,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    clear_status();
     println!("\nGoodbye!");
     Ok(())
 }
