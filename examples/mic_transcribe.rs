@@ -539,10 +539,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Audio callback - accumulates samples when listening
-    // Buffer limit: ~60 seconds at 16kHz = 960,000 samples
-    const MAX_BUFFER_SAMPLES: usize = 960_000;
-    // Force transcription when buffer reaches this threshold (~45 seconds)
-    const FORCE_TRANSCRIBE_THRESHOLD: usize = 720_000;
+    // Buffer limit: ~12 seconds at 16kHz = 192,000 samples
+    const MAX_BUFFER_SAMPLES: usize = 192_000;
+    // Handle buffer when it reaches this threshold (~8 seconds)
+    const BUFFER_FULL_THRESHOLD: usize = 128_000;
     let listening_clone = listening.clone();
     let audio_buffer_clone = audio_buffer.clone();
     let stream = device.build_input_stream(
@@ -756,24 +756,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Trigger transcription if:
                 // 1. VAD detects end of speech, OR
-                // 2. Buffer is getting full (force transcription to avoid losing audio)
+                // 2. Buffer is getting full (transcribe if speech, discard if silence)
                 let vad_triggered = vad.process(recent);
-                let buffer_full = buffer_len >= FORCE_TRANSCRIBE_THRESHOLD;
+                let buffer_full = buffer_len >= BUFFER_FULL_THRESHOLD;
 
                 if vad_triggered || buffer_full {
-                    if buffer_full && !vad_triggered {
-                        print!("\r\x1b[K[BUFFER FULL] Forcing transcription...");
-                        std::io::stdout().flush()?;
-                    }
+                    // Check if buffer has speech content
+                    let has_speech = has_speech_content(&buffer);
 
-                    // Only proceed if we can actually transcribe (not already busy)
-                    if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                        // Now safe to take the samples since we'll actually transcribe them
-                        let samples = buffer.clone();
+                    // If buffer is full but no speech, just discard and continue
+                    if buffer_full && !has_speech {
                         buffer.clear();
                         drop(buffer);
+                        vad.reset();
+                        continue;
+                    }
 
-                        if has_speech_content(&samples) {
+                    // Only proceed with transcription if we have speech
+                    if has_speech {
+                        // Only proceed if we can actually transcribe (not already busy)
+                        if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            // Now safe to take the samples since we'll actually transcribe them
+                            let samples = buffer.clone();
+                            buffer.clear();
+                            drop(buffer);
+
                             print!("\r\x1b[K[TRANSCRIBING] Processing segment ({:.1}s)...", samples.len() as f32 / SAMPLE_RATE as f32);
                             std::io::stdout().flush()?;
                             write_status("transcribing");
@@ -797,21 +804,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Still listening in toggle mode, so go back to listening state
                                 write_status("listening");
                             });
-                        } else {
-                            // No speech content, release the lock
-                            transcribing.store(false, Ordering::SeqCst);
+                        } else if buffer_full {
+                            // Buffer is full but we're busy transcribing
+                            // Drop oldest audio to make room for new
+                            let drop_samples = buffer_len / 2; // Drop oldest 50%
+                            buffer.drain(0..drop_samples);
+                            drop(buffer);
                         }
-                    } else if buffer_full {
-                        // Buffer is full but we're busy transcribing - warn user
-                        // Keep the buffer (don't clear) so we don't lose audio
-                        // But we need to drop some old audio to make room for new
-                        let drop_samples = buffer_len / 4; // Drop oldest 25%
-                        buffer.drain(0..drop_samples);
-                        drop(buffer);
-                        eprintln!("\r\x1b[K[WARNING] Transcription busy, dropped {:.1}s of old audio", drop_samples as f32 / SAMPLE_RATE as f32);
+                        // If VAD triggered but transcribing is busy, keep accumulating
+                        // (don't clear buffer, audio will be transcribed when current one finishes)
                     }
-                    // If VAD triggered but transcribing is busy, keep accumulating
-                    // (don't clear buffer, audio will be transcribed when current one finishes)
                 }
             }
         }
