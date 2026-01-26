@@ -125,6 +125,91 @@ fn has_speech_content(samples: &[f32]) -> bool {
     calculate_rms(samples) >= MIN_SPEECH_RMS
 }
 
+/// Inverse Text Normalization (ITN) - convert spoken numbers to digits
+fn normalize_numbers(text: &str) -> String {
+    use std::collections::HashMap;
+
+    // Basic number words to digits
+    let units: HashMap<&str, &str> = [
+        ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"), ("four", "4"),
+        ("five", "5"), ("six", "6"), ("seven", "7"), ("eight", "8"), ("nine", "9"),
+        ("ten", "10"), ("eleven", "11"), ("twelve", "12"), ("thirteen", "13"),
+        ("fourteen", "14"), ("fifteen", "15"), ("sixteen", "16"), ("seventeen", "17"),
+        ("eighteen", "18"), ("nineteen", "19"),
+    ].into_iter().collect();
+
+    let tens: HashMap<&str, u32> = [
+        ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50),
+        ("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90),
+    ].into_iter().collect();
+
+    let mut result = text.to_lowercase();
+
+    // Handle compound numbers like "twenty-three" or "twenty three"
+    for (ten_word, ten_val) in &tens {
+        for (unit_word, unit_str) in &units {
+            let unit_val: u32 = unit_str.parse().unwrap_or(0);
+            if unit_val >= 1 && unit_val <= 9 {
+                let compound = ten_val + unit_val;
+                // Match "twenty-three" or "twenty three"
+                let hyphenated = format!("{}-{}", ten_word, unit_word);
+                let spaced = format!("{} {}", ten_word, unit_word);
+                result = result.replace(&hyphenated, &compound.to_string());
+                result = result.replace(&spaced, &compound.to_string());
+            }
+        }
+    }
+
+    // Handle standalone tens (twenty, thirty, etc.)
+    for (ten_word, ten_val) in &tens {
+        // Use word boundaries to avoid partial replacements
+        let pattern = format!(r"\b{}\b", ten_word);
+        if let Ok(re) = regex::Regex::new(&pattern) {
+            result = re.replace_all(&result, ten_val.to_string().as_str()).to_string();
+        }
+    }
+
+    // Handle standalone units (one, two, etc.) - be careful with common words
+    // Only replace when they appear as standalone numbers, not in phrases
+    for (unit_word, unit_str) in &units {
+        // Skip words that are commonly used in non-numeric contexts
+        if *unit_word == "one" || *unit_word == "two" || *unit_word == "four" {
+            continue; // These are too ambiguous ("one of", "two of", "four" as adjective)
+        }
+        let pattern = format!(r"\b{}\b", unit_word);
+        if let Ok(re) = regex::Regex::new(&pattern) {
+            result = re.replace_all(&result, *unit_str).to_string();
+        }
+    }
+
+    // Handle "hundred" and "thousand" patterns
+    // e.g., "three hundred" -> "300", "five thousand" -> "5000"
+    if let Ok(re) = regex::Regex::new(r"\b(\d+)\s+hundred\b") {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            let num: u32 = caps[1].parse().unwrap_or(0);
+            (num * 100).to_string()
+        }).to_string();
+    }
+
+    if let Ok(re) = regex::Regex::new(r"\b(\d+)\s+thousand\b") {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            let num: u32 = caps[1].parse().unwrap_or(0);
+            (num * 1000).to_string()
+        }).to_string();
+    }
+
+    // Handle "X hundred Y" pattern (e.g., "3 hundred 50" -> "350")
+    if let Ok(re) = regex::Regex::new(r"\b(\d+)00\s+(\d{1,2})\b") {
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            let hundreds: u32 = caps[1].parse().unwrap_or(0);
+            let rest: u32 = caps[2].parse().unwrap_or(0);
+            (hundreds * 100 + rest).to_string()
+        }).to_string();
+    }
+
+    result
+}
+
 // i3status-rust integration
 const STATUS_FILE: &str = "/tmp/parakeet-status";
 const CONTROL_FILE: &str = "/tmp/parakeet-control";
@@ -652,7 +737,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Ok(mut model) = model.try_lock() {
                                         match model.transcribe_samples(samples, SAMPLE_RATE, CHANNELS, None) {
                                             Ok(result) => {
-                                                let text = result.text.trim().to_string();
+                                                let text = normalize_numbers(result.text.trim());
                                                 if !text.is_empty() {
                                                     let _ = tx.send(text);
                                                 }
@@ -720,7 +805,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(mut model) = model.try_lock() {
                                     match model.transcribe_samples(samples, SAMPLE_RATE, CHANNELS, None) {
                                         Ok(result) => {
-                                            let text = result.text.trim().to_string();
+                                            let text = normalize_numbers(result.text.trim());
                                             if !text.is_empty() {
                                                 let _ = tx.send(text);
                                             }
@@ -792,7 +877,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(mut model) = model.try_lock() {
                                     match model.transcribe_samples(samples, SAMPLE_RATE, CHANNELS, None) {
                                         Ok(result) => {
-                                            let text = result.text.trim().to_string();
+                                            let text = normalize_numbers(result.text.trim());
                                             if !text.is_empty() {
                                                 let _ = tx.send(text);
                                             }
@@ -1256,5 +1341,75 @@ mod tests {
         // Let's verify this works correctly
         assert!(config.is_pressed(&[Keycode::LControl, Keycode::LShift]));
         assert!(!config.is_pressed(&[Keycode::RControl, Keycode::RShift]));
+    }
+
+    // ==================== Number Normalization Tests ====================
+
+    #[test]
+    fn test_normalize_compound_numbers_hyphenated() {
+        assert_eq!(normalize_numbers("twenty-one"), "21");
+        assert_eq!(normalize_numbers("thirty-two"), "32");
+        assert_eq!(normalize_numbers("forty-five"), "45");
+        assert_eq!(normalize_numbers("ninety-nine"), "99");
+    }
+
+    #[test]
+    fn test_normalize_compound_numbers_spaced() {
+        assert_eq!(normalize_numbers("twenty one"), "21");
+        assert_eq!(normalize_numbers("thirty two"), "32");
+        assert_eq!(normalize_numbers("fifty seven"), "57");
+    }
+
+    #[test]
+    fn test_normalize_standalone_tens() {
+        assert_eq!(normalize_numbers("twenty"), "20");
+        assert_eq!(normalize_numbers("thirty"), "30");
+        assert_eq!(normalize_numbers("forty"), "40");
+        assert_eq!(normalize_numbers("ninety"), "90");
+    }
+
+    #[test]
+    fn test_normalize_teens() {
+        assert_eq!(normalize_numbers("thirteen"), "13");
+        assert_eq!(normalize_numbers("fifteen"), "15");
+        assert_eq!(normalize_numbers("nineteen"), "19");
+    }
+
+    #[test]
+    fn test_normalize_in_sentence() {
+        assert_eq!(
+            normalize_numbers("I have thirty-two apples"),
+            "i have 32 apples"
+        );
+        assert_eq!(
+            normalize_numbers("The answer is forty-two"),
+            "the answer is 42"
+        );
+    }
+
+    #[test]
+    fn test_normalize_hundreds() {
+        assert_eq!(normalize_numbers("5 hundred"), "500");
+        assert_eq!(normalize_numbers("3 hundred"), "300");
+    }
+
+    #[test]
+    fn test_normalize_preserves_existing_digits() {
+        assert_eq!(normalize_numbers("I have 5 items"), "i have 5 items");
+        assert_eq!(normalize_numbers("room 42"), "room 42");
+    }
+
+    #[test]
+    fn test_normalize_multiple_numbers() {
+        assert_eq!(
+            normalize_numbers("twenty-one and thirty-two"),
+            "21 and 32"
+        );
+    }
+
+    #[test]
+    fn test_normalize_case_insensitive() {
+        assert_eq!(normalize_numbers("THIRTY-TWO"), "32");
+        assert_eq!(normalize_numbers("Forty-Five"), "45");
     }
 }
