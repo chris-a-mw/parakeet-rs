@@ -7,10 +7,11 @@ Usage:
     cargo run --release --example mic_transcribe --features cuda -- ../parakeet-tdt-0.6b-v3-onnx
 
 Config file (~/.config/mic_transcribe.conf):
-    hotkey = LAlt+Grave
-    mode = hold    # hold = press-to-talk, toggle = press to start/stop
-    # or: hotkey = F12
-    # or: hotkey = RControl+Space
+    hotkey = Ctrl+Alt+Shift   # Generic modifiers match either side of keyboard
+    mode = hold               # hold = press-to-talk, toggle = press to start/stop
+    # or: hotkey = LAlt+Grave           # Specific left-alt + grave key
+    # or: hotkey = F12                  # Single key
+    # or: hotkey = LControl+LShift+R    # Specific side modifiers
 
 Controls:
     Configured hotkey - Toggle listening on/off (works globally, any window)
@@ -25,6 +26,7 @@ While listening:
 Supported keys: F1-F20, Grave, Home, End, Insert, Delete, PageUp, PageDown,
                 Space, Tab, Escape, Enter, Backspace, A-Z, 0-9
 Supported modifiers: LAlt, RAlt, LControl, RControl, LShift, RShift, LMeta, RMeta
+Generic modifiers (match either side): Ctrl, Alt, Shift, Meta/Super
 
 Requirements:
     - TDT v3 ONNX model directory
@@ -201,27 +203,46 @@ struct Config {
     mode: PttMode,
 }
 
+/// Represents a modifier that can match either left or right variants
+#[derive(Clone)]
+enum Modifier {
+    Specific(Keycode),           // Exact key (e.g., LControl)
+    Either(Keycode, Keycode),    // Either variant (e.g., LControl OR RControl)
+}
+
+impl Modifier {
+    fn is_pressed(&self, keys: &[Keycode]) -> bool {
+        match self {
+            Modifier::Specific(k) => keys.contains(k),
+            Modifier::Either(l, r) => keys.contains(l) || keys.contains(r),
+        }
+    }
+}
+
 /// Hotkey configuration with optional modifiers
 #[derive(Clone)]
 struct HotkeyConfig {
-    key: Keycode,
-    modifiers: Vec<Keycode>,
+    key: Option<Keycode>,        // Main key (optional for modifier-only combos)
+    modifiers: Vec<Modifier>,
     display_name: String,
 }
 
 impl HotkeyConfig {
     fn is_pressed(&self, keys: &[Keycode]) -> bool {
-        // Check main key is pressed
-        if !keys.contains(&self.key) {
-            return false;
-        }
-        // Check all modifiers are pressed
-        for modifier in &self.modifiers {
-            if !keys.contains(modifier) {
+        // Check main key is pressed (if specified)
+        if let Some(ref key) = self.key {
+            if !keys.contains(key) {
                 return false;
             }
         }
-        true
+        // Check all modifiers are pressed
+        for modifier in &self.modifiers {
+            if !modifier.is_pressed(keys) {
+                return false;
+            }
+        }
+        // Must have at least one key requirement
+        self.key.is_some() || !self.modifiers.is_empty()
     }
 }
 
@@ -328,19 +349,34 @@ fn is_modifier(keycode: &Keycode) -> bool {
     )
 }
 
+/// Parse generic modifier names that match either left or right variants
+fn parse_generic_modifier(key_name: &str) -> Option<Modifier> {
+    match key_name.to_lowercase().as_str() {
+        "control" | "ctrl" => Some(Modifier::Either(Keycode::LControl, Keycode::RControl)),
+        "alt" => Some(Modifier::Either(Keycode::LAlt, Keycode::RAlt)),
+        "shift" => Some(Modifier::Either(Keycode::LShift, Keycode::RShift)),
+        "meta" | "super" => Some(Modifier::Either(Keycode::LMeta, Keycode::RMeta)),
+        _ => None,
+    }
+}
+
 fn parse_hotkey_combo(combo: &str) -> Option<HotkeyConfig> {
     let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
     if parts.is_empty() {
         return None;
     }
 
-    let mut modifiers = Vec::new();
-    let mut main_key = None;
+    let mut modifiers: Vec<Modifier> = Vec::new();
+    let mut main_key: Option<Keycode> = None;
 
     for part in &parts {
-        if let Some(keycode) = parse_keycode(part) {
+        // First, try parsing as a generic modifier (Control, Alt, Shift, Meta)
+        if let Some(generic_mod) = parse_generic_modifier(part) {
+            modifiers.push(generic_mod);
+        } else if let Some(keycode) = parse_keycode(part) {
+            // Specific keycode - could be a specific modifier or a regular key
             if is_modifier(&keycode) && parts.len() > 1 {
-                modifiers.push(keycode);
+                modifiers.push(Modifier::Specific(keycode));
             } else {
                 main_key = Some(keycode);
             }
@@ -350,8 +386,13 @@ fn parse_hotkey_combo(combo: &str) -> Option<HotkeyConfig> {
         }
     }
 
-    main_key.map(|key| HotkeyConfig {
-        key,
+    // Allow modifier-only combos (e.g., Ctrl+Alt+Shift)
+    if main_key.is_none() && modifiers.is_empty() {
+        return None;
+    }
+
+    Some(HotkeyConfig {
+        key: main_key,
         modifiers,
         display_name: combo.to_string(),
     })
@@ -433,12 +474,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  echo 'hotkey = LAlt+R' > {}", config_path.display());
                 println!("  echo 'mode = hold' >> {}", config_path.display());
             }
-            // Default config
+            // Default config: Ctrl+Alt+Shift (either side)
             Config {
                 hotkey: HotkeyConfig {
-                    key: Keycode::Grave,
-                    modifiers: vec![],
-                    display_name: "Grave (`)".to_string(),
+                    key: None,
+                    modifiers: vec![
+                        Modifier::Either(Keycode::LControl, Keycode::RControl),
+                        Modifier::Either(Keycode::LAlt, Keycode::RAlt),
+                        Modifier::Either(Keycode::LShift, Keycode::RShift),
+                    ],
+                    display_name: "Ctrl+Alt+Shift".to_string(),
                 },
                 mode: PttMode::Toggle,
             }
@@ -494,8 +539,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Audio callback - accumulates samples when listening
-    // Buffer limit: ~30 seconds at 16kHz = 480,000 samples
-    const MAX_BUFFER_SAMPLES: usize = 480_000;
+    // Buffer limit: ~60 seconds at 16kHz = 960,000 samples
+    const MAX_BUFFER_SAMPLES: usize = 960_000;
+    // Force transcription when buffer reaches this threshold (~45 seconds)
+    const FORCE_TRANSCRIBE_THRESHOLD: usize = 720_000;
     let listening_clone = listening.clone();
     let audio_buffer_clone = audio_buffer.clone();
     let stream = device.build_input_stream(
@@ -510,6 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if buffer.len() + resampled.len() <= MAX_BUFFER_SAMPLES {
                     buffer.extend(resampled);
                 }
+                // Note: if buffer is full, new audio is dropped - main loop handles this
             }
         },
         |err| eprintln!("Audio stream error: {}", err),
@@ -699,22 +747,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (In hold mode, user controls when to stop via key release)
         if is_listening && ptt_mode == PttMode::Toggle {
             let mut buffer = audio_buffer.lock().unwrap();
+            let buffer_len = buffer.len();
 
-            if buffer.len() > 1600 {
+            if buffer_len > 1600 {
                 // Check last ~100ms for VAD
-                let check_start = buffer.len().saturating_sub(1600);
+                let check_start = buffer_len.saturating_sub(1600);
                 let recent = &buffer[check_start..];
 
-                if vad.process(recent) {
-                    // End of speech detected - transcribe this segment if it has content
-                    let samples = buffer.clone();
-                    buffer.clear(); // Clear for next utterance
-                    drop(buffer);
+                // Trigger transcription if:
+                // 1. VAD detects end of speech, OR
+                // 2. Buffer is getting full (force transcription to avoid losing audio)
+                let vad_triggered = vad.process(recent);
+                let buffer_full = buffer_len >= FORCE_TRANSCRIBE_THRESHOLD;
 
-                    if has_speech_content(&samples) {
-                        // Skip if already transcribing to prevent pile-up
-                        if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                            print!("\r\x1b[K[TRANSCRIBING] Processing segment...");
+                if vad_triggered || buffer_full {
+                    if buffer_full && !vad_triggered {
+                        print!("\r\x1b[K[BUFFER FULL] Forcing transcription...");
+                        std::io::stdout().flush()?;
+                    }
+
+                    // Only proceed if we can actually transcribe (not already busy)
+                    if transcribing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        // Now safe to take the samples since we'll actually transcribe them
+                        let samples = buffer.clone();
+                        buffer.clear();
+                        drop(buffer);
+
+                        if has_speech_content(&samples) {
+                            print!("\r\x1b[K[TRANSCRIBING] Processing segment ({:.1}s)...", samples.len() as f32 / SAMPLE_RATE as f32);
                             std::io::stdout().flush()?;
                             write_status("transcribing");
 
@@ -737,8 +797,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Still listening in toggle mode, so go back to listening state
                                 write_status("listening");
                             });
+                        } else {
+                            // No speech content, release the lock
+                            transcribing.store(false, Ordering::SeqCst);
                         }
+                    } else if buffer_full {
+                        // Buffer is full but we're busy transcribing - warn user
+                        // Keep the buffer (don't clear) so we don't lose audio
+                        // But we need to drop some old audio to make room for new
+                        let drop_samples = buffer_len / 4; // Drop oldest 25%
+                        buffer.drain(0..drop_samples);
+                        drop(buffer);
+                        eprintln!("\r\x1b[K[WARNING] Transcription busy, dropped {:.1}s of old audio", drop_samples as f32 / SAMPLE_RATE as f32);
                     }
+                    // If VAD triggered but transcribing is busy, keep accumulating
+                    // (don't clear buffer, audio will be transcribed when current one finishes)
                 }
             }
         }
@@ -758,5 +831,428 @@ fn truncate_for_display(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars.saturating_sub(3)).collect();
         format!("{}...", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_generic_modifier_ctrl() {
+        let modifier = parse_generic_modifier("Ctrl").unwrap();
+        match modifier {
+            Modifier::Either(l, r) => {
+                assert_eq!(l, Keycode::LControl);
+                assert_eq!(r, Keycode::RControl);
+            }
+            _ => panic!("Expected Either variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_generic_modifier_alt() {
+        let modifier = parse_generic_modifier("Alt").unwrap();
+        match modifier {
+            Modifier::Either(l, r) => {
+                assert_eq!(l, Keycode::LAlt);
+                assert_eq!(r, Keycode::RAlt);
+            }
+            _ => panic!("Expected Either variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_generic_modifier_shift() {
+        let modifier = parse_generic_modifier("Shift").unwrap();
+        match modifier {
+            Modifier::Either(l, r) => {
+                assert_eq!(l, Keycode::LShift);
+                assert_eq!(r, Keycode::RShift);
+            }
+            _ => panic!("Expected Either variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_generic_modifier_meta() {
+        let modifier = parse_generic_modifier("Meta").unwrap();
+        match modifier {
+            Modifier::Either(l, r) => {
+                assert_eq!(l, Keycode::LMeta);
+                assert_eq!(r, Keycode::RMeta);
+            }
+            _ => panic!("Expected Either variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_hotkey_combo_single_key() {
+        let config = parse_hotkey_combo("F12").unwrap();
+        assert_eq!(config.key, Some(Keycode::F12));
+        assert!(config.modifiers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hotkey_combo_specific_modifier_and_key() {
+        let config = parse_hotkey_combo("LControl+Space").unwrap();
+        assert_eq!(config.key, Some(Keycode::Space));
+        assert_eq!(config.modifiers.len(), 1);
+        match &config.modifiers[0] {
+            Modifier::Specific(k) => assert_eq!(*k, Keycode::LControl),
+            _ => panic!("Expected Specific variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_hotkey_combo_generic_modifiers_only() {
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        assert_eq!(config.key, None);
+        assert_eq!(config.modifiers.len(), 3);
+
+        // Check all are Either variants
+        for modifier in &config.modifiers {
+            match modifier {
+                Modifier::Either(_, _) => {}
+                _ => panic!("Expected Either variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_hotkey_combo_mixed_modifiers_and_key() {
+        let config = parse_hotkey_combo("Ctrl+Shift+R").unwrap();
+        assert_eq!(config.key, Some(Keycode::R));
+        assert_eq!(config.modifiers.len(), 2);
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_single_key() {
+        let config = parse_hotkey_combo("F12").unwrap();
+        assert!(config.is_pressed(&[Keycode::F12]));
+        assert!(!config.is_pressed(&[Keycode::F11]));
+        assert!(!config.is_pressed(&[]));
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_specific_modifier() {
+        let config = parse_hotkey_combo("LControl+Space").unwrap();
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::Space]));
+        assert!(!config.is_pressed(&[Keycode::RControl, Keycode::Space])); // Wrong side
+        assert!(!config.is_pressed(&[Keycode::Space])); // Missing modifier
+        assert!(!config.is_pressed(&[Keycode::LControl])); // Missing key
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_generic_modifier_left_side() {
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        // Left side should work
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::LAlt, Keycode::LShift]));
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_generic_modifier_right_side() {
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        // Right side should work
+        assert!(config.is_pressed(&[Keycode::RControl, Keycode::RAlt, Keycode::RShift]));
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_generic_modifier_mixed_sides() {
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        // Mixed sides should also work (LCtrl + RAlt + LShift)
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::RAlt, Keycode::LShift]));
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_generic_modifier_missing_one() {
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        // Missing one modifier should fail
+        assert!(!config.is_pressed(&[Keycode::LControl, Keycode::LAlt]));
+        assert!(!config.is_pressed(&[Keycode::LControl, Keycode::LShift]));
+        assert!(!config.is_pressed(&[Keycode::LAlt, Keycode::LShift]));
+    }
+
+    #[test]
+    fn test_hotkey_is_pressed_with_extra_keys() {
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        // Extra keys should be ignored (hotkey still works)
+        assert!(config.is_pressed(&[
+            Keycode::LControl,
+            Keycode::LAlt,
+            Keycode::LShift,
+            Keycode::A
+        ]));
+    }
+
+    #[test]
+    fn test_parse_hotkey_combo_invalid_key() {
+        assert!(parse_hotkey_combo("InvalidKey").is_none());
+        assert!(parse_hotkey_combo("Ctrl+InvalidKey").is_none());
+    }
+
+    #[test]
+    fn test_parse_hotkey_combo_empty() {
+        assert!(parse_hotkey_combo("").is_none());
+    }
+
+    #[test]
+    fn test_modifier_either_is_pressed() {
+        let modifier = Modifier::Either(Keycode::LControl, Keycode::RControl);
+        assert!(modifier.is_pressed(&[Keycode::LControl]));
+        assert!(modifier.is_pressed(&[Keycode::RControl]));
+        assert!(modifier.is_pressed(&[Keycode::LControl, Keycode::RControl]));
+        assert!(!modifier.is_pressed(&[Keycode::LAlt]));
+        assert!(!modifier.is_pressed(&[]));
+    }
+
+    #[test]
+    fn test_modifier_specific_is_pressed() {
+        let modifier = Modifier::Specific(Keycode::LControl);
+        assert!(modifier.is_pressed(&[Keycode::LControl]));
+        assert!(!modifier.is_pressed(&[Keycode::RControl]));
+        assert!(!modifier.is_pressed(&[]));
+    }
+
+    // ==================== Edge Cases ====================
+
+    #[test]
+    fn test_case_insensitivity() {
+        // All case variations should parse the same
+        assert!(parse_hotkey_combo("ctrl").is_some());
+        assert!(parse_hotkey_combo("CTRL").is_some());
+        assert!(parse_hotkey_combo("Ctrl").is_some());
+        assert!(parse_hotkey_combo("cTrL").is_some());
+
+        // They should all produce equivalent behavior
+        let lower = parse_hotkey_combo("ctrl+alt+shift").unwrap();
+        let upper = parse_hotkey_combo("CTRL+ALT+SHIFT").unwrap();
+        let mixed = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+
+        let keys = vec![Keycode::LControl, Keycode::LAlt, Keycode::LShift];
+        assert!(lower.is_pressed(&keys));
+        assert!(upper.is_pressed(&keys));
+        assert!(mixed.is_pressed(&keys));
+    }
+
+    #[test]
+    fn test_whitespace_around_plus() {
+        // Spaces around + should be trimmed
+        let config = parse_hotkey_combo("Ctrl + Alt + Shift").unwrap();
+        assert_eq!(config.modifiers.len(), 3);
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::LAlt, Keycode::LShift]));
+
+        // Tabs and multiple spaces
+        let config2 = parse_hotkey_combo("Ctrl  +  Alt").unwrap();
+        assert!(config2.is_pressed(&[Keycode::LControl, Keycode::LAlt]));
+    }
+
+    #[test]
+    fn test_single_modifier_as_hotkey() {
+        // A single specific modifier should work as a hotkey
+        let config = parse_hotkey_combo("LControl").unwrap();
+        assert_eq!(config.key, Some(Keycode::LControl));
+        assert!(config.modifiers.is_empty());
+        assert!(config.is_pressed(&[Keycode::LControl]));
+        assert!(!config.is_pressed(&[Keycode::RControl]));
+
+        // A single generic modifier should also work
+        let config2 = parse_hotkey_combo("Ctrl").unwrap();
+        // When it's the only key, it becomes the main key (not a modifier)
+        // Wait, let me check this...actually for a single generic modifier,
+        // it should be treated as a modifier-only hotkey
+        assert!(config2.is_pressed(&[Keycode::LControl]));
+        assert!(config2.is_pressed(&[Keycode::RControl]));
+    }
+
+    #[test]
+    fn test_both_sides_pressed_satisfies_generic() {
+        let config = parse_hotkey_combo("Ctrl").unwrap();
+        // Both LControl and RControl pressed should still satisfy Ctrl
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::RControl]));
+    }
+
+    #[test]
+    fn test_order_independence() {
+        // Different orderings should produce functionally equivalent hotkeys
+        let order1 = parse_hotkey_combo("Ctrl+Alt+Shift").unwrap();
+        let order2 = parse_hotkey_combo("Shift+Ctrl+Alt").unwrap();
+        let order3 = parse_hotkey_combo("Alt+Shift+Ctrl").unwrap();
+
+        let keys = vec![Keycode::LControl, Keycode::LAlt, Keycode::LShift];
+        assert!(order1.is_pressed(&keys));
+        assert!(order2.is_pressed(&keys));
+        assert!(order3.is_pressed(&keys));
+    }
+
+    #[test]
+    fn test_empty_parts_rejected() {
+        // Double plus should fail (creates empty part)
+        assert!(parse_hotkey_combo("Ctrl++Alt").is_none());
+        // Trailing plus
+        assert!(parse_hotkey_combo("Ctrl+").is_none());
+        // Leading plus
+        assert!(parse_hotkey_combo("+Ctrl").is_none());
+    }
+
+    #[test]
+    fn test_control_ctrl_aliases() {
+        // Both "Control" and "Ctrl" should work
+        let ctrl = parse_hotkey_combo("Ctrl").unwrap();
+        let control = parse_hotkey_combo("Control").unwrap();
+
+        assert!(ctrl.is_pressed(&[Keycode::LControl]));
+        assert!(control.is_pressed(&[Keycode::LControl]));
+        assert!(ctrl.is_pressed(&[Keycode::RControl]));
+        assert!(control.is_pressed(&[Keycode::RControl]));
+    }
+
+    #[test]
+    fn test_super_meta_aliases() {
+        // Both "Super" and "Meta" should work
+        let super_mod = parse_hotkey_combo("Super").unwrap();
+        let meta = parse_hotkey_combo("Meta").unwrap();
+
+        assert!(super_mod.is_pressed(&[Keycode::LMeta]));
+        assert!(meta.is_pressed(&[Keycode::LMeta]));
+        assert!(super_mod.is_pressed(&[Keycode::RMeta]));
+        assert!(meta.is_pressed(&[Keycode::RMeta]));
+    }
+
+    #[test]
+    fn test_complex_combo_with_key() {
+        // Multiple modifiers plus a regular key
+        let config = parse_hotkey_combo("Ctrl+Alt+Shift+R").unwrap();
+        assert_eq!(config.key, Some(Keycode::R));
+        assert_eq!(config.modifiers.len(), 3);
+
+        // Should work with all modifiers and key pressed
+        assert!(config.is_pressed(&[
+            Keycode::LControl,
+            Keycode::LAlt,
+            Keycode::LShift,
+            Keycode::R
+        ]));
+
+        // Missing the key should fail
+        assert!(!config.is_pressed(&[Keycode::LControl, Keycode::LAlt, Keycode::LShift]));
+
+        // Missing one modifier should fail
+        assert!(!config.is_pressed(&[Keycode::LControl, Keycode::LAlt, Keycode::R]));
+    }
+
+    #[test]
+    fn test_specific_and_generic_modifiers_mixed() {
+        // Mix specific (LControl) with generic (Alt)
+        let config = parse_hotkey_combo("LControl+Alt+R").unwrap();
+        assert_eq!(config.key, Some(Keycode::R));
+
+        // LControl + LAlt should work
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::LAlt, Keycode::R]));
+        // LControl + RAlt should also work (Alt is generic)
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::RAlt, Keycode::R]));
+        // RControl should NOT work (LControl is specific)
+        assert!(!config.is_pressed(&[Keycode::RControl, Keycode::LAlt, Keycode::R]));
+    }
+
+    #[test]
+    fn test_all_function_keys() {
+        // Spot check several function keys
+        for (name, expected) in [
+            ("F1", Keycode::F1),
+            ("F12", Keycode::F12),
+            ("F20", Keycode::F20),
+        ] {
+            let config = parse_hotkey_combo(name).unwrap();
+            assert_eq!(config.key, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_special_keys() {
+        // Test various special key names
+        for (name, expected) in [
+            ("Grave", Keycode::Grave),
+            ("`", Keycode::Grave),
+            ("backtick", Keycode::Grave),
+            ("Space", Keycode::Space),
+            ("Tab", Keycode::Tab),
+            ("Escape", Keycode::Escape),
+            ("Esc", Keycode::Escape),
+            ("Enter", Keycode::Enter),
+            ("Return", Keycode::Enter),
+        ] {
+            let config = parse_hotkey_combo(name).unwrap();
+            assert_eq!(config.key, Some(expected), "Failed for key: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_is_pressed_empty_config_returns_false() {
+        // A config with no key and no modifiers should never match
+        // (This shouldn't be possible to create via parse, but test the struct directly)
+        let config = HotkeyConfig {
+            key: None,
+            modifiers: vec![],
+            display_name: "empty".to_string(),
+        };
+        assert!(!config.is_pressed(&[]));
+        assert!(!config.is_pressed(&[Keycode::A]));
+    }
+
+    #[test]
+    fn test_very_long_key_list() {
+        // Hotkey should match even with many extra keys pressed
+        let config = parse_hotkey_combo("Ctrl+R").unwrap();
+        let many_keys = vec![
+            Keycode::A,
+            Keycode::B,
+            Keycode::C,
+            Keycode::LControl,
+            Keycode::R,
+            Keycode::D,
+            Keycode::E,
+        ];
+        assert!(config.is_pressed(&many_keys));
+    }
+
+    #[test]
+    fn test_number_keys() {
+        for i in 0..=9 {
+            let name = format!("{}", i);
+            let config = parse_hotkey_combo(&name).unwrap();
+            assert!(config.key.is_some(), "Failed for number key: {}", i);
+        }
+    }
+
+    #[test]
+    fn test_letter_keys() {
+        for c in 'a'..='z' {
+            let config = parse_hotkey_combo(&c.to_string()).unwrap();
+            assert!(config.key.is_some(), "Failed for letter key: {}", c);
+        }
+    }
+
+    #[test]
+    fn test_modifier_only_two_keys() {
+        // Two generic modifiers without a main key
+        let config = parse_hotkey_combo("Ctrl+Shift").unwrap();
+        assert_eq!(config.key, None);
+        assert_eq!(config.modifiers.len(), 2);
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::LShift]));
+        assert!(config.is_pressed(&[Keycode::RControl, Keycode::RShift]));
+    }
+
+    #[test]
+    fn test_specific_modifier_only() {
+        // Two specific modifiers (same side)
+        let config = parse_hotkey_combo("LControl+LShift").unwrap();
+        // When there are only modifiers, the last one becomes the "main key"
+        // Actually, let me verify this by checking the implementation...
+        // From the parse logic: specific modifiers are added to modifiers vec when parts.len() > 1
+        // So with two specific modifiers, the last one becomes main_key
+        // Let's verify this works correctly
+        assert!(config.is_pressed(&[Keycode::LControl, Keycode::LShift]));
+        assert!(!config.is_pressed(&[Keycode::RControl, Keycode::RShift]));
     }
 }
