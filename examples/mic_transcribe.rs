@@ -37,6 +37,7 @@ Requirements:
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use device_query::{DeviceQuery, DeviceState, Keycode};
 use enigo::{Enigo, Keyboard, Settings};
+use nnnoiseless::DenoiseState;
 use parakeet_rs::{ParakeetTDT, Transcriber};
 use std::env;
 use std::fs;
@@ -51,10 +52,10 @@ const SAMPLE_RATE: u32 = 16000;
 const CHANNELS: u16 = 1;
 
 // VAD configuration
-const RMS_THRESHOLD: f32 = 0.01;
-const SILENCE_DURATION_MS: u64 = 500;
+const RMS_THRESHOLD: f32 = 0.005; // Lowered for better sensitivity
+const SILENCE_DURATION_MS: u64 = 720;
 const MIN_SPEECH_SAMPLES: usize = 8000; // ~0.5s minimum
-const MIN_SPEECH_RMS: f32 = 0.005; // Minimum RMS to consider audio as containing speech
+const MIN_SPEECH_RMS: f32 = 0.0025; // Minimum RMS to consider audio as containing speech
 
 struct RmsVad {
     threshold: f32,
@@ -109,6 +110,63 @@ impl RmsVad {
     }
 }
 
+/// Audio processor that handles mono conversion, denoising, and resampling
+/// Denoises at 48kHz (RNNoise native rate) then outputs at 16kHz for VAD/transcription
+struct AudioProcessor {
+    denoise_state: Box<DenoiseState<'static>>,
+    pending_samples: Vec<f32>, // Buffer for incomplete 480-sample frames
+    device_sample_rate: u32,
+    device_channels: u16,
+}
+
+impl AudioProcessor {
+    fn new(device_sample_rate: u32, device_channels: u16) -> Self {
+        Self {
+            denoise_state: DenoiseState::new(),
+            pending_samples: Vec::new(),
+            device_sample_rate,
+            device_channels,
+        }
+    }
+
+    /// Process raw audio: mono → 48kHz → denoise → 16kHz
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        const RNNOISE_RATE: u32 = 48000;
+        const FRAME_SIZE: usize = 480;
+
+        // Convert to mono
+        let mono = to_mono(input, self.device_channels);
+
+        // Resample to 48kHz if needed
+        let at_48k = if self.device_sample_rate != RNNOISE_RATE {
+            resample(&mono, self.device_sample_rate, RNNOISE_RATE)
+        } else {
+            mono
+        };
+
+        // Add to pending buffer
+        self.pending_samples.extend(at_48k);
+
+        // Process complete 480-sample frames
+        let mut denoised_48k = Vec::new();
+        while self.pending_samples.len() >= FRAME_SIZE {
+            let mut input_frame = [0.0f32; FRAME_SIZE];
+            let mut output_frame = [0.0f32; FRAME_SIZE];
+            input_frame.copy_from_slice(&self.pending_samples[..FRAME_SIZE]);
+            self.denoise_state.process_frame(&mut output_frame, &input_frame);
+            denoised_48k.extend_from_slice(&output_frame);
+            self.pending_samples.drain(0..FRAME_SIZE);
+        }
+
+        // Resample to 16kHz for VAD/transcription
+        if denoised_48k.is_empty() {
+            Vec::new()
+        } else {
+            resample(&denoised_48k, RNNOISE_RATE, SAMPLE_RATE)
+        }
+    }
+}
+
 fn calculate_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -118,11 +176,19 @@ fn calculate_rms(samples: &[f32]) -> f32 {
 }
 
 /// Check if audio buffer contains actual speech content (not just silence/noise)
+/// Checks in chunks to avoid missing speech buried in mostly-silent audio
 fn has_speech_content(samples: &[f32]) -> bool {
     if samples.len() < MIN_SPEECH_SAMPLES {
         return false;
     }
-    calculate_rms(samples) >= MIN_SPEECH_RMS
+    // Check 0.5s chunks - if any chunk has speech, return true
+    let chunk_size = 8000; // 0.5s at 16kHz
+    for chunk in samples.chunks(chunk_size) {
+        if chunk.len() >= chunk_size / 2 && calculate_rms(chunk) >= MIN_SPEECH_RMS {
+            return true;
+        }
+    }
+    false
 }
 
 /// Inverse Text Normalization (ITN) - convert spoken numbers to digits
@@ -536,7 +602,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let running = Arc::new(AtomicBool::new(true));
     let listening = Arc::new(AtomicBool::new(false));
     let transcribing = Arc::new(AtomicBool::new(false)); // Prevent transcription pile-up
+    let speech_started = Arc::new(AtomicBool::new(false)); // Skip silence until speech detected
     let audio_buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let audio_processor = Arc::new(Mutex::new(AudioProcessor::new(device_sample_rate, device_channels)));
 
     // Ctrl+C handler
     {
@@ -548,24 +616,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
-    // Audio callback - accumulates samples when listening
+    // Audio callback - accumulates denoised samples when listening
     // Buffer limit: ~12 seconds at 16kHz = 192,000 samples
     const MAX_BUFFER_SAMPLES: usize = 192_000;
     // Handle buffer when it reaches this threshold (~8 seconds)
     const BUFFER_FULL_THRESHOLD: usize = 128_000;
     let listening_clone = listening.clone();
+    let speech_started_clone = speech_started.clone();
     let audio_buffer_clone = audio_buffer.clone();
+    let audio_processor_clone = audio_processor.clone();
     let stream = device.build_input_stream(
         &stream_config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             if listening_clone.load(Ordering::SeqCst) {
-                let mono = to_mono(data, device_channels);
-                let resampled = resample(&mono, device_sample_rate, SAMPLE_RATE);
+                // Process: mono → 48kHz → denoise → 16kHz
+                let processed = audio_processor_clone.lock().unwrap().process(data);
+                if processed.is_empty() {
+                    return; // Not enough samples for a complete frame yet
+                }
+
+                // Skip silence at the beginning - only start buffering once speech is detected
+                if !speech_started_clone.load(Ordering::SeqCst) {
+                    let rms = calculate_rms(&processed);
+                    if rms < RMS_THRESHOLD {
+                        return; // Still waiting for speech to start
+                    }
+                    speech_started_clone.store(true, Ordering::SeqCst);
+                }
 
                 let mut buffer = audio_buffer_clone.lock().unwrap();
                 // Cap buffer to prevent unbounded growth
-                if buffer.len() + resampled.len() <= MAX_BUFFER_SAMPLES {
-                    buffer.extend(resampled);
+                if buffer.len() + processed.len() <= MAX_BUFFER_SAMPLES {
+                    buffer.extend(processed);
                 }
                 // Note: if buffer is full, new audio is dropped - main loop handles this
             }
@@ -644,6 +726,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut buffer = audio_buffer.lock().unwrap();
                             buffer.clear();
                         }
+                        speech_started.store(false, Ordering::SeqCst); // Reset to skip initial silence
                         vad.reset();
                         println!("\r\x1b[K[LISTENING] Speak now... (press {} to stop)", hotkey_config.display_name);
                         write_status("listening");
@@ -689,6 +772,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut buffer = audio_buffer.lock().unwrap();
                         buffer.clear();
                     }
+                    speech_started.store(false, Ordering::SeqCst); // Reset to skip initial silence
                     vad.reset();
                     println!("\r\x1b[K[LISTENING] Recording... (click or release {} to transcribe)", hotkey_config.display_name);
                     write_status("listening");
@@ -700,6 +784,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut buffer = audio_buffer.lock().unwrap();
                         buffer.clear();
                     }
+                    speech_started.store(false, Ordering::SeqCst); // Reset to skip initial silence
                     vad.reset();
                     println!("\r\x1b[K[LISTENING] Recording... (release {} to transcribe)", hotkey_config.display_name);
                     write_status("listening");

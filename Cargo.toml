@@ -48,6 +48,7 @@ cpal = "0.15"
 ctrlc = "3.4"
 device_query = "2.1"
 enigo = "0.3"
+nnnoiseless = "0.5"
 text2num = "2.6"
 
 [features]
